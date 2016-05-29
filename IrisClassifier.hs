@@ -8,12 +8,12 @@ import Data.List (unzip5, zip5)
 main :: IO ()
 main = do
     input <- openFile "iris.data" ReadMode
-    dataset <- readDataset input []
+    dataset <- readDataset input
     hClose input
     shuffledDataset <- shuffle dataset
     let folds = 5
     let trainTestPairs = crossValidationSplit folds shuffledDataset
-    let scores = map buildAndTestModel trainTestPairs
+    scores <- mapM buildAndTestModel trainTestPairs
     let (preOptScores, postOptScores) = unzip scores
     let meanPreOptScore = sum preOptScores / (fromIntegral folds)
     let meanPostOptScore = sum postOptScores / (fromIntegral folds)
@@ -53,30 +53,13 @@ extractFolds xs lens = extractFolds' xs [] lens
                         (newFold, front ++ rest) :
                         extractFolds' rest (front ++ newFold) lens
                     where (newFold, rest) = splitAt len xs
-                          newFront = front ++ newFold
 
 
 -- problem-specific definitions
-type DataItem = (Double, Double, Double, Double, Iris)
-type DataSet = [DataItem]
-
-readDataset :: Handle -> DataSet -> IO DataSet
-readDataset input xs = do
-    endOfInput <- hIsEOF input
-    if endOfInput
-    then return xs
-    else do
-        line <- hGetLine input
-        let entries = splitWith ',' line
-        let [a, b, c, d] = map (\n -> read n :: Double) $ take 4 entries
-        let entryClass = head $ drop 4 entries
-        let dataItem = (a, b, c, d, irisFromString entryClass)
-        readDataset input (dataItem : xs)
-
 data Iris = Setosa
           | Versicolor
           | Virginica
-          deriving Show
+          deriving (Show, Eq)
 
 irisFromString :: String -> Iris
 irisFromString s = case s of
@@ -101,7 +84,37 @@ irisFromDouble val | val >= 1 && val < 2 = Versicolor
 irisFromDouble val | val >= 1 && val <= 3 = Virginica
 
 
+type DataItem = (Double, Double, Double, Double, Iris)
+type DataSet = [DataItem]
+itemClass :: DataItem -> Iris
+itemClass (_, _, _, _, iris) = iris
+
+itemFeatures :: DataItem -> (Double, Double, Double, Double)
+itemFeatures (a, b, c, d, _) = (a, b, c, d)
+
 type ProcessedDataItem = (Double, Double, Double, Double, Double)
+
+
+readDataset :: Handle -> IO DataSet
+readDataset input = readDataset' input []
+
+readDataset' :: Handle -> DataSet -> IO DataSet
+readDataset' input xs = do
+    endOfInput <- hIsEOF input
+    if endOfInput
+    then return xs
+    else do
+        line <- hGetLine input
+        let entries = splitWith ',' line
+        if length entries == 5
+        then do
+            let toDouble = \n -> read n :: Double
+            let [a, b, c, d] = map toDouble $ take 4 entries
+            let entryClass = head $ drop 4 entries
+            let dataItem = (a, b, c, d, irisFromString entryClass)
+            readDataset' input (dataItem : xs)
+        else do
+            readDataset' input xs
 
 preprocess :: DataSet -> [ProcessedDataItem]
 preprocess dataset = zip5 as' bs' cs' ds' irises'
@@ -113,11 +126,29 @@ preprocess dataset = zip5 as' bs' cs' ds' irises'
                                      invSpan = 1.0 / (max - min)
                                  in map (\x -> invSpan * (x - min)) xs 
 
--- identifyModel :: [ProcessedDataItem] -> Model
--- identifyModel dataset = ???
+computeScore :: [Iris] -> [Iris] -> Double
+computeScore predictions answers | null predictions || null answers = 0.0
+computeScore predictions answers =
+    let denominator = length answers
+        numerator = length $ filter id $ zipWith (==) predictions answers
+    in fromIntegral numerator / fromIntegral denominator
 
-buildAndTestModel :: (DataSet, DataSet) -> (Double, Double)
-buildAndTestModel (train, test) = (1.0, 1.0)
+predict :: Model -> (Double, Double, Double, Double) -> Double
+predict model ftrs = 1.5
+
+buildAndTestModel :: (DataSet, DataSet) -> IO (Double, Double)
+buildAndTestModel (train, test) = do
+        let procTrain = preprocess train
+        let procTest = preprocess test
+        let testClasses = map itemClass test
+        model <- identifyModel procTrain
+        let preOptPredictions = map (predictClass model) test
+        let preOptScore = computeScore preOptPredictions testClasses
+        model <- optimizeModel model procTrain
+        let postOptPredictions = map (predictClass model) test
+        let postOptScore = computeScore postOptPredictions testClasses
+        return (preOptScore, postOptScore)
+    where predictClass m = irisFromDouble . predict m . itemFeatures
 
 crossValidationSplit :: Int -> DataSet -> [(DataSet, DataSet)]
 crossValidationSplit folds dataset =
@@ -128,5 +159,14 @@ crossValidationSplit folds dataset =
             foldSizes = replicate leftover smallerFoldSize ++
                         replicate (folds - leftover) biggerFoldSize
         in extractFolds dataset foldSizes
-           
+
+
+-- Model-specific definitions
+data Model = TSKZero [Double] [Double] [Double]
+
+identifyModel :: [ProcessedDataItem] -> IO Model
+identifyModel dataset = return (TSKZero [] [] [])
+
+optimizeModel :: Model -> [ProcessedDataItem] -> IO Model
+optimizeModel m _ = return m
 
