@@ -134,7 +134,14 @@ computeScore predictions answers =
     in fromIntegral numerator / fromIntegral denominator
 
 predict :: Model -> (Double, Double, Double, Double) -> Double
-predict model ftrs = 1.5
+predict (TSKZero rulesCount aSets cSets bs) (x, y, z, w) =
+    let antecedent (x, a, c) = exp $ (x - c) ** 2 / ((-2) * a * a)
+        aggregate (as, cs, xs) = product $ map antecedent $ zip3 xs as cs
+        inputSets = replicate rulesCount [x, y, z, w]
+        rules = map aggregate $ zip3 aSets cSets inputSets
+        numerator = sum $ map (\(p, b) -> p * b) $ zip rules bs
+        denominator = sum rules
+    in numerator / denominator
 
 buildAndTestModel :: (DataSet, DataSet) -> IO (Double, Double)
 buildAndTestModel (train, test) = do
@@ -162,10 +169,10 @@ crossValidationSplit folds dataset =
 
 
 -- Model-specific definitions
-data Model = TSKZero [Double] [Double] [Double]
+data Model = TSKZero Int [[Double]] [[Double]] [Double]
 
 identifyModel :: [ProcessedDataItem] -> IO Model
-identifyModel dataset = return (TSKZero [] [] [])
+identifyModel dataset = return (TSKZero 0 [] [] [])
 
 optimizeModel :: Model -> [ProcessedDataItem] -> IO Model
 optimizeModel m _ = return m
