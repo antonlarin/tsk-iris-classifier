@@ -4,6 +4,9 @@ import Data.Array.IO (IOArray, newListArray, readArray, writeArray)
 import Control.Monad (forM)
 import Data.Char (toLower)
 import Data.List (unzip5, zip5)
+import qualified Data.Sequence as Sqnc
+import Data.Foldable (toList, foldl')
+import Data.Function (on)
 
 main :: IO ()
 main = do
@@ -53,6 +56,9 @@ extractFolds xs lens = extractFolds' xs [] lens
                         (newFold, front ++ rest) :
                         extractFolds' rest (front ++ newFold) lens
                     where (newFold, rest) = splitAt len xs
+
+avg :: Fractional b => (a -> b) -> [a] -> b
+avg f xs = (foldl' (+) 0.0 (map f xs)) / (fromIntegral (length xs))
 
 
 -- problem-specific definitions
@@ -171,7 +177,54 @@ crossValidationSplit folds dataset =
 -- Model-specific definitions
 data Model = TSKZero Int [[Double]] [[Double]] [Double]
 
+euclidean :: [Double] -> [Double] -> Double
+euclidean [] [] = 0.0
+euclidean xs ys | length xs /= length ys = error "Euclidean: uneven lists"
+euclidean (x:xs) (y:ys) = abs (x - y) ** 2 + euclidean xs ys
+
+d :: [Double] -> [Double] -> Int -> Sqnc.Seq Int -> Double
+d x c n ns = (fromIntegral n) * euclidean c x / (fromIntegral $ sum ns)
+
+newCluster c x alpha = map updateClusterElems cWithX
+    where updateClusterElems (ce, xe) = ce + alpha * (xe - ce)
+          cWithX = zip c x
+
+structIdEpoch :: Int -> Int -> Sqnc.Seq [Double] -> Sqnc.Seq Int ->
+    Double -> Double -> [ProcessedDataItem] -> Double -> Sqnc.Seq [Double]
+structIdEpoch epoch maxEpoch cs _ _ _ _ _| epoch == maxEpoch = cs
+structIdEpoch epoch maxEpoch cs ns alphaW alphaR ds eps =
+    let iteration (cs, ns, alphaW, alphaR) (x, y, z, v, _) =
+            let ftrs = [x, y, z, v]
+                indices = Sqnc.fromFunction (length cs) id
+                criterion = compare `on` \(_, cs, n) -> d ftrs cs n ns
+                clusters = Sqnc.zip3 indices cs ns
+                [(wi, w, wn), (ri, r, rn)] = toList $ Sqnc.take 2
+                        (Sqnc.sortBy criterion clusters)
+                newNs = Sqnc.update wi (wn + 1) ns
+                mAlphaR = (-1) * alphaR
+                newCs = (Sqnc.update wi (newCluster w ftrs alphaW)) $
+                        (Sqnc.update ri (newCluster r ftrs malphaR)) cs
+                epochRatio = (fromIntegral epoch) / (fromIntegral maxEpoch)
+                newAlphaW = alphaW * (1.0 - epochRatio)
+                newAlphaR = alphaR * (1.0 - epochRatio)
+            in (newCs, newNs, newAlphaW, newAlphaR)
+        (newCs, newNs, newAlphaW, newAlphaR) = foldl' iteration (cs, ns, alphaW, alphaR) ds
+        diff = avg (\(oldC, newC, newN) -> d oldC newC newN newNs) $
+                toList (Sqnc.zip3 cs newCs newNs)
+    in if diff < eps
+       then newCs
+       else structIdEpoch (epoch + 1) maxEpoch newCs newNs newAlphaW newAlphaR ds eps
+
 identifyModel :: [ProcessedDataItem] -> IO Model
+-- identifyModel dataset = do
+        -- let clusterWins = replicate clusterCountLimit 1
+    -- where
+        -- clusterCountLimit = 20
+        -- maxEpoch = 5
+        -- epsilon = 0.0001
+        -- alphaW = 0.7
+        -- alphaR = 0.5
+    
 identifyModel dataset = return (TSKZero 0 [] [] [])
 
 optimizeModel :: Model -> [ProcessedDataItem] -> IO Model
