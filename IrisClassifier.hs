@@ -1,9 +1,9 @@
 import System.IO
-import System.Random (randomRIO)
+import System.Random (randomRIO, mkStdGen, setStdGen)
 import Data.Array.IO (IOArray, newListArray, readArray, writeArray)
 import Control.Monad (forM)
 import Data.Char (toLower)
-import Data.List (unzip5, zip5)
+import Data.List (unzip5, zip5, sortBy)
 import qualified Data.Sequence as Sqnc
 import Data.Foldable (toList, foldl')
 import Data.Function (on)
@@ -13,6 +13,8 @@ main = do
     input <- openFile "iris.data" ReadMode
     dataset <- readDataset input
     hClose input
+    let seed = 154
+    setStdGen $ mkStdGen seed
     shuffledDataset <- shuffle dataset
     let folds = 5
     let trainTestPairs = crossValidationSplit folds shuffledDataset
@@ -85,9 +87,9 @@ irisToDouble Versicolor = 1.5
 irisToDouble Virginica = 2.5
 
 irisFromDouble :: Double -> Iris
-irisFromDouble val | val < 1 = Setosa
-irisFromDouble val | val >= 1 && val < 2 = Versicolor
-irisFromDouble val | val >= 1 && val <= 3 = Virginica
+irisFromDouble val | 0 <= val && val < 1 = Setosa
+                   | 1 <= val && val < 2 = Versicolor
+                   | 2 <= val && val <= 3 = Virginica
 
 
 type DataItem = (Double, Double, Double, Double, Iris)
@@ -95,10 +97,13 @@ type DataSet = [DataItem]
 itemClass :: DataItem -> Iris
 itemClass (_, _, _, _, iris) = iris
 
-itemFeatures :: DataItem -> (Double, Double, Double, Double)
-itemFeatures (a, b, c, d, _) = (a, b, c, d)
-
 type ProcessedDataItem = (Double, Double, Double, Double, Double)
+
+procItemResponse :: ProcessedDataItem -> Double
+procItemResponse (_, _, _, _, resp) = resp
+
+procItemFeatures :: ProcessedDataItem -> (Double, Double, Double, Double)
+procItemFeatures (a, b, c, d, _) = (a, b, c, d)
 
 
 readDataset :: Handle -> IO DataSet
@@ -139,15 +144,18 @@ computeScore predictions answers =
         numerator = length $ filter id $ zipWith (==) predictions answers
     in fromIntegral numerator / fromIntegral denominator
 
+antecedent :: ([Double], [Double], [Double]) -> Double
+antecedent (xs, as, cs) = product $ map antecedentConjunct $ zip3 xs as cs
+    where antecedentConjunct (x, a, c) = exp ((x - c) ** 2 / ((-2) * a * a))
+
 predict :: Model -> (Double, Double, Double, Double) -> Double
 predict (TSKZero rulesCount aSets cSets bs) (x, y, z, w) =
-    let antecedent (x, a, c) = exp $ (x - c) ** 2 / ((-2) * a * a)
-        aggregate (as, cs, xs) = product $ map antecedent $ zip3 xs as cs
-        inputSets = replicate rulesCount [x, y, z, w]
-        rules = map aggregate $ zip3 aSets cSets inputSets
-        numerator = sum $ map (\(p, b) -> p * b) $ zip rules bs
-        denominator = sum rules
+    let inputSets = replicate rulesCount [x, y, z, w]
+        antecedents = map antecedent $ zip3 inputSets aSets cSets
+        numerator = sum $ map tupleProduct $ zip antecedents bs
+        denominator = sum antecedents
     in numerator / denominator
+    where tupleProduct (p, b) = p * b
 
 buildAndTestModel :: (DataSet, DataSet) -> IO (Double, Double)
 buildAndTestModel (train, test) = do
@@ -155,13 +163,13 @@ buildAndTestModel (train, test) = do
         let procTest = preprocess test
         let testClasses = map itemClass test
         model <- identifyModel procTrain
-        let preOptPredictions = map (predictClass model) test
+        let preOptPredictions = map (predictClass model) procTest
         let preOptScore = computeScore preOptPredictions testClasses
         model <- optimizeModel model procTrain
-        let postOptPredictions = map (predictClass model) test
+        let postOptPredictions = map (predictClass model) procTest
         let postOptScore = computeScore postOptPredictions testClasses
         return (preOptScore, postOptScore)
-    where predictClass m = irisFromDouble . predict m . itemFeatures
+    where predictClass m = irisFromDouble . predict m . procItemFeatures
 
 crossValidationSplit :: Int -> DataSet -> [(DataSet, DataSet)]
 crossValidationSplit folds dataset =
@@ -180,52 +188,70 @@ data Model = TSKZero Int [[Double]] [[Double]] [Double]
 euclidean :: [Double] -> [Double] -> Double
 euclidean [] [] = 0.0
 euclidean xs ys | length xs /= length ys = error "Euclidean: uneven lists"
-euclidean (x:xs) (y:ys) = abs (x - y) ** 2 + euclidean xs ys
+euclidean (x:xs) (y:ys) = (x - y) ** 2 + euclidean xs ys
 
-d :: [Double] -> [Double] -> Int -> Sqnc.Seq Int -> Double
-d x c n ns = (fromIntegral n) * euclidean c x / (fromIntegral $ sum ns)
+d :: [Double] -> [Double] -> Int -> Int -> Double
+d x c n nSum = (fromIntegral n) * euclidean c x / (fromIntegral nSum)
 
-newCluster c x alpha = map updateClusterElems cWithX
+newCluster c x alpha = map updateClusterElems (zip c x)
     where updateClusterElems (ce, xe) = ce + alpha * (xe - ce)
-          cWithX = zip c x
 
 structIdEpoch :: Int -> Int -> Sqnc.Seq [Double] -> Sqnc.Seq Int ->
     Double -> Double -> [ProcessedDataItem] -> Double -> Sqnc.Seq [Double]
-structIdEpoch epoch maxEpoch cs _ _ _ _ _| epoch == maxEpoch = cs
+structIdEpoch epoch maxEpoch cs _ _ _ _ _| epoch > maxEpoch = cs
 structIdEpoch epoch maxEpoch cs ns alphaW alphaR ds eps =
-    let iteration (cs, ns, alphaW, alphaR) (x, y, z, v, _) =
-            let ftrs = [x, y, z, v]
+    let epochRatio = (fromIntegral epoch) / (fromIntegral maxEpoch)
+        iteration (cs, ns, alphaW, alphaR) (x, z, u, v, _) =
+            let ftrs = [x, z, u, v]
                 indices = Sqnc.fromFunction (length cs) id
-                criterion = compare `on` \(_, cs, n) -> d ftrs cs n ns
+                nSum = sum ns
+                criterion = compare `on` \(_, cs, n) -> d ftrs cs n nSum
                 clusters = Sqnc.zip3 indices cs ns
                 [(wi, w, wn), (ri, r, rn)] = toList $ Sqnc.take 2
                         (Sqnc.sortBy criterion clusters)
                 newNs = Sqnc.update wi (wn + 1) ns
-                mAlphaR = (-1) * alphaR
-                newCs = (Sqnc.update wi (newCluster w ftrs alphaW)) $
-                        (Sqnc.update ri (newCluster r ftrs malphaR)) cs
-                epochRatio = (fromIntegral epoch) / (fromIntegral maxEpoch)
+                newCs = Sqnc.update wi (newCluster w ftrs alphaW) $
+                        Sqnc.update ri (newCluster r ftrs (-alphaR)) cs
                 newAlphaW = alphaW * (1.0 - epochRatio)
                 newAlphaR = alphaR * (1.0 - epochRatio)
             in (newCs, newNs, newAlphaW, newAlphaR)
         (newCs, newNs, newAlphaW, newAlphaR) = foldl' iteration (cs, ns, alphaW, alphaR) ds
-        diff = avg (\(oldC, newC, newN) -> d oldC newC newN newNs) $
+        diff = avg (\(oldC, newC, newN) -> d oldC newC newN (sum newNs)) $
                 toList (Sqnc.zip3 cs newCs newNs)
     in if diff < eps
        then newCs
        else structIdEpoch (epoch + 1) maxEpoch newCs newNs newAlphaW newAlphaR ds eps
 
 identifyModel :: [ProcessedDataItem] -> IO Model
--- identifyModel dataset = do
-        -- let clusterWins = replicate clusterCountLimit 1
-    -- where
-        -- clusterCountLimit = 20
-        -- maxEpoch = 5
-        -- epsilon = 0.0001
-        -- alphaW = 0.7
-        -- alphaR = 0.5
-    
-identifyModel dataset = return (TSKZero 0 [] [] [])
+identifyModel dataset = do
+        let startNs = Sqnc.replicate clusterCountLimit 1
+        -- produce initial distribution for c
+        let startCs = Sqnc.replicate clusterCountLimit [0.5, 0.5, 0.5, 0.5]
+        let cs = structIdEpoch 1 maxEpoch startCs startNs alphaW alphaR dataset epsilon
+        let filteredCs = toList (Sqnc.filter (all insideZeroOne) cs)
+        let as = toList (map (findAs filteredCs) filteredCs)
+        let features = map procItemFeatures dataset
+        let responses = map procItemResponse dataset
+        let bs = map (findB features responses) (zip as filteredCs)
+        return (TSKZero (length as) as filteredCs bs)
+    where
+        clusterCountLimit = 20
+        maxEpoch = 5
+        epsilon = 0.0001
+        alphaW = 0.7
+        alphaR = 0.5
+        insideZeroOne v = 0 <= v && v <= 1
+        r = 1.5
+        findAs cs c = let (ck:ch:_) = sortBy (closestToC) cs
+                      in replicate 4 (euclidean ck ch / r)
+            where closestToC = compare `on` (\c' -> euclidean c c')
+        findB ftrs rspns (as, cs) = if denom == 0
+                                    then 0.0
+                                    else numer / denom
+            where step (numer', denom') ((x, z, u, v), y) =
+                        let alpha = antecedent ([x, z, u, v], as, cs)
+                        in (numer' + alpha * y, denom' + alpha)
+                  (numer, denom) = foldl' step (0.0, 0.0) $ zip ftrs rspns
 
 optimizeModel :: Model -> [ProcessedDataItem] -> IO Model
 optimizeModel m _ = return m
