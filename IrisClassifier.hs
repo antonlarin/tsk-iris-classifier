@@ -14,7 +14,7 @@ main = do
     dataset <- readDataset input
     hClose input
     let seed = 154
-    setStdGen $ mkStdGen seed
+    --setStdGen $ mkStdGen seed
     shuffledDataset <- shuffle dataset
     let folds = 5
     let trainTestPairs = crossValidationSplit folds shuffledDataset
@@ -225,8 +225,9 @@ structIdEpoch epoch maxEpoch cs ns alphaW alphaR ds eps =
 identifyModel :: [ProcessedDataItem] -> IO Model
 identifyModel dataset = do
         let startNs = Sqnc.replicate clusterCountLimit 1
-        -- produce initial distribution for c
-        let startCs = Sqnc.replicate clusterCountLimit [0.5, 0.5, 0.5, 0.5]
+        let rand = \_ -> randomRIO (0.0, 1.0)
+        startCs <- forM (Sqnc.fromList [1..clusterCountLimit]) $
+                   \_ -> forM [1..4] rand
         let cs = structIdEpoch 1 maxEpoch startCs startNs alphaW alphaR dataset epsilon
         let filteredCs = toList (Sqnc.filter (all insideZeroOne) cs)
         let as = toList (map (findAs filteredCs) filteredCs)
@@ -235,11 +236,11 @@ identifyModel dataset = do
         let bs = map (findB features responses) (zip as filteredCs)
         return (TSKZero (length as) as filteredCs bs)
     where
-        clusterCountLimit = 20
-        maxEpoch = 5
+        clusterCountLimit = 30
+        maxEpoch = 10
         epsilon = 0.0001
-        alphaW = 0.7
-        alphaR = 0.5
+        alphaW = 0.06
+        alphaR = 0.02
         insideZeroOne v = 0 <= v && v <= 1
         r = 1.5
         findAs cs c = let (ck:ch:_) = sortBy (closestToC) cs
