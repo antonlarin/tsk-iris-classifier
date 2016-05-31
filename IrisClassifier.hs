@@ -3,7 +3,7 @@ import System.Random (randomRIO, mkStdGen, setStdGen)
 import Data.Array.IO (IOArray, newListArray, readArray, writeArray)
 import Control.Monad (forM)
 import Data.Char (toLower)
-import Data.List (unzip5, zip5, sortBy)
+import Data.List (unzip5, zip5, zip6, sortBy)
 import qualified Data.Sequence as Sqnc
 import Data.Foldable (toList, foldl')
 import Data.Function (on)
@@ -16,7 +16,7 @@ main = do
     let seed = 154
     --setStdGen $ mkStdGen seed
     shuffledDataset <- shuffle dataset
-    let folds = 5
+    let folds = 10
     let trainTestPairs = crossValidationSplit folds shuffledDataset
     scores <- mapM buildAndTestModel trainTestPairs
     let (preOptScores, postOptScores) = unzip scores
@@ -62,6 +62,8 @@ extractFolds xs lens = extractFolds' xs [] lens
 avg :: Fractional b => (a -> b) -> [a] -> b
 avg f xs = (foldl' (+) 0.0 (map f xs)) / (fromIntegral (length xs))
 
+insideZeroOne :: Double -> Bool
+insideZeroOne v = 0 <= v && v <= 1
 
 -- problem-specific definitions
 data Iris = Setosa
@@ -185,6 +187,23 @@ crossValidationSplit folds dataset =
 -- Model-specific definitions
 data Model = TSKZero Int [[Double]] [[Double]] [Double]
 
+paramsVector :: Model -> ([Double], Int, Int)
+paramsVector (TSKZero clusterCount as cs bs) =
+        (flatten as ++ flatten cs ++ bs, clusterCount, length (head as))
+    where flatten xss = foldl' (++) [] xss
+
+fromParamsVector :: ([Double], Int, Int) -> Model
+fromParamsVector (xs, clusterCount, featureCount) =
+    let
+        (as, xs') = extractACs clusterCount xs
+        (cs, bs) = extractACs clusterCount xs'
+    in TSKZero clusterCount as cs bs
+    where
+        extractACs clustersLeft xs | clustersLeft == 0 = ([], xs)
+        extractACs clustersLeft xs = (cluster : otherACs, otherVec)
+            where (cluster, rest) = splitAt featureCount xs
+                  (otherACs, otherVec) = extractACs (clustersLeft - 1) rest
+
 euclidean :: [Double] -> [Double] -> Double
 euclidean [] [] = 0.0
 euclidean xs ys | length xs /= length ys = error "Euclidean: uneven lists"
@@ -197,8 +216,8 @@ newCluster c x alpha = map updateClusterElems (zip c x)
     where updateClusterElems (ce, xe) = ce + alpha * (xe - ce)
 
 structIdEpoch :: Int -> Int -> Sqnc.Seq [Double] -> Sqnc.Seq Int ->
-    Double -> Double -> [ProcessedDataItem] -> Double -> Sqnc.Seq [Double]
-structIdEpoch epoch maxEpoch cs _ _ _ _ _| epoch > maxEpoch = cs
+    Double -> Double -> [ProcessedDataItem] -> Double -> (Sqnc.Seq [Double], Int, Double)
+structIdEpoch epoch maxEpoch cs _ _ _ _ _| epoch > maxEpoch = (cs, epoch - 1, 0.0)
 structIdEpoch epoch maxEpoch cs ns alphaW alphaR ds eps =
     let epochRatio = (fromIntegral epoch) / (fromIntegral maxEpoch)
         iteration (cs, ns, alphaW, alphaR) (x, z, u, v, _) =
@@ -219,7 +238,7 @@ structIdEpoch epoch maxEpoch cs ns alphaW alphaR ds eps =
         diff = avg (\(oldC, newC, newN) -> d oldC newC newN (sum newNs)) $
                 toList (Sqnc.zip3 cs newCs newNs)
     in if diff < eps
-       then newCs
+       then (newCs, epoch, diff)
        else structIdEpoch (epoch + 1) maxEpoch newCs newNs newAlphaW newAlphaR ds eps
 
 identifyModel :: [ProcessedDataItem] -> IO Model
@@ -228,7 +247,9 @@ identifyModel dataset = do
         let rand = \_ -> randomRIO (0.0, 1.0)
         startCs <- forM (Sqnc.fromList [1..clusterCountLimit]) $
                    \_ -> forM [1..4] rand
-        let cs = structIdEpoch 1 maxEpoch startCs startNs alphaW alphaR dataset epsilon
+        let (cs, epochs, diff) = structIdEpoch 1 maxEpoch startCs startNs alphaW alphaR dataset epsilon
+        putStrLn $ "Epochs required: " ++ show epochs
+        putStrLn $ "Diff achieved: " ++ show diff
         let filteredCs = toList (Sqnc.filter (all insideZeroOne) cs)
         let as = toList (map (findAs filteredCs) filteredCs)
         let features = map procItemFeatures dataset
@@ -241,7 +262,6 @@ identifyModel dataset = do
         epsilon = 0.0001
         alphaW = 0.06
         alphaR = 0.02
-        insideZeroOne v = 0 <= v && v <= 1
         r = 1.5
         findAs cs c = let (ck:ch:_) = sortBy (closestToC) cs
                       in replicate 4 (euclidean ck ch / r)
@@ -254,6 +274,88 @@ identifyModel dataset = do
                         in (numer' + alpha * y, denom' + alpha)
                   (numer, denom) = foldl' step (0.0, 0.0) $ zip ftrs rspns
 
+
+costFunction :: Int -> Int -> [ProcessedDataItem] -> [Double] -> Double
+costFunction clusterCount featureCount dataset xs =
+    let model = fromParamsVector (xs, clusterCount, featureCount)
+        localCost (x, z, u, v, y) = (predict model (x, z, u, v) - y) ** 2 
+    in avg id (map localCost dataset)
+
+constraints :: Int -> Int -> [Double] -> [Bool]
+constraints clusterCount featureCount xs =
+        checkA (clusterCount * featureCount) xs
+    where
+        checkA 0 ys = checkC (clusterCount * featureCount) ys
+        checkA elemsLeft (y:ys) = (y > 0) : checkA (elemsLeft - 1) ys
+
+        checkC 0 ys = checkB clusterCount ys
+        checkC elemsLeft (y:ys) = insideZeroOne y : checkC (elemsLeft - 1) ys
+
+        checkB 0 [] = []
+        checkB elemsLeft (y:ys) = someClass y : checkB (elemsLeft - 1) ys
+            where someClass y = 0.0 <= y && y <= 3.0
+
+
+psoIteration :: Int -> Int -> Double ->
+    [[Double]] -> [[Double]] -> [[Double]] -> [Double] ->
+    ([Double] -> Double) -> ([Double] -> [Bool]) -> IO [[Double]]
+psoIteration iter maxIter _  xs _ _ _ _ _ | iter > maxIter = return xs
+psoIteration iter maxIter costThreshold xs vs ps pg cost checkConstraints =
+    let
+    in do
+        let components = length xs
+        rands1 <- forM [1..components] $ \_ -> randomRIO (0.0, 1.0)
+        rands2 <- forM [1..components] $ \_ -> randomRIO (0.0, 1.0)
+        let newVs = map stepV $ zip5 xs vs ps rands1 rands2
+        let (newXs, correctedVs) = unzip $ map stepX $ zip xs newVs
+        let newPs = map chooseLessCostly $ zip ps xs
+        let newPg = head $ sortBy (compare `on` cost) (pg : xs)
+        if cost newPg < costThreshold
+        then return newXs
+        else psoIteration (iter + 1) maxIter costThreshold
+                    newXs correctedVs newPs newPg cost checkConstraints
+    where
+        w = 0.5
+        c1 = 0.3
+        c2 = 0.6
+
+        stepV (x, v, p, rand1, rand2) = map stepVComponent $
+                zip6 x v p pg replicatedRand1 replicatedRand2
+            where stepVComponent (xe, ve, pe, pge, rand1, rand2) = w * ve +
+                    c1 * rand1 * (pe - xe) + c2 * rand2 * (pge - xe)
+                  replicatedRand1 = replicate (length x) rand1
+                  replicatedRand2 = replicate (length x) rand2
+
+        stepX (x, v) =
+            let newX = map (\(xe, ve) -> xe + ve) $ zip x v -- no constraints
+                brokenConstraints = checkConstraints newX
+            in if any id brokenConstraints
+               then stepX (x, shrinkV v brokenConstraints)
+               else (x, v)
+            where shrinkV v constraintsMask =
+                    map (\(v, p) -> if p then 0.5 * v else v) $
+                    zip v constraintsMask
+
+        chooseLessCostly (a, b) | cost a < cost b = a
+                                | otherwise       = b
+
 optimizeModel :: Model -> [ProcessedDataItem] -> IO Model
-optimizeModel m _ = return m
+optimizeModel model dataset = do
+        let (x0, clusterCount, featureCount) = paramsVector model
+        let n = length x0
+        let rand = \_ -> randomRIO (0.0, 1.0)
+        otherXs <- forM [1..(swarmSize - 1)] $
+                   \_ -> forM [1..n] rand
+        let xs = x0 : otherXs
+        let vs = replicate swarmSize (replicate n 0.0)
+        let cost = costFunction clusterCount featureCount dataset
+        let pg = head (sortBy (compare `on` cost) xs)
+
+        optimizedXs <- psoIteration 1 maxIterations costThreshold xs vs xs pg cost (constraints clusterCount featureCount)
+        let optimizedParams = head optimizedXs
+        return (fromParamsVector (optimizedParams, clusterCount, featureCount))
+    where
+        swarmSize = 50
+        maxIterations = 50
+        costThreshold = 0.1
 
