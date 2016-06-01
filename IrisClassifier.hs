@@ -14,14 +14,14 @@ main = do
     dataset <- readDataset input
     hClose input
     let seed = 154
-    --setStdGen $ mkStdGen seed
+    setStdGen $ mkStdGen seed
     shuffledDataset <- shuffle dataset
     let folds = 10
     let trainTestPairs = crossValidationSplit folds shuffledDataset
     scores <- mapM buildAndTestModel trainTestPairs
     let (preOptScores, postOptScores) = unzip scores
-    let meanPreOptScore = sum preOptScores / (fromIntegral folds)
-    let meanPostOptScore = sum postOptScores / (fromIntegral folds)
+    let meanPreOptScore = avg preOptScores
+    let meanPostOptScore = avg postOptScores
     putStrLn $ "Pre opt: " ++ show meanPreOptScore
     putStrLn $ "Post opt: " ++ show meanPostOptScore
 
@@ -40,15 +40,18 @@ shuffle xs = do
           listToArray :: Int -> [a] -> IO (IOArray Int a)
           listToArray n xs = newListArray (1, n) xs
 
-splitWith :: Char -> String -> [String]
+splitWith :: (a -> Bool) -> [a] -> [[a]]
 splitWith _ [] = []
-splitWith sep lines = front : splitWith sep back
-            where notSep = (/= sep)
-                  front = takeWhile notSep lines
-                  backWithSep = dropWhile notSep lines
-                  back = if null backWithSep
-                         then []
-                         else tail backWithSep
+splitWith isSep xs = front : splitWith isSep back
+    where (front, backWithSep) = splitInTwo ([], xs)
+          back = if null backWithSep
+                 then []
+                 else tail backWithSep
+          splitInTwo res | null $ snd res = res
+          splitInTwo (partialFront, xs@(x:xs')) =
+                if isSep x
+                then (partialFront, xs)
+                else splitInTwo (partialFront ++ [x], xs')
 
 extractFolds :: [a] -> [Int] -> [([a], [a])]
 extractFolds xs lens = extractFolds' xs [] lens
@@ -59,8 +62,11 @@ extractFolds xs lens = extractFolds' xs [] lens
                         extractFolds' rest (front ++ newFold) lens
                     where (newFold, rest) = splitAt len xs
 
-avg :: Fractional b => (a -> b) -> [a] -> b
-avg f xs = (foldl' (+) 0.0 (map f xs)) / (fromIntegral (length xs))
+avgBy :: Fractional b => (a -> b) -> [a] -> b
+avgBy f xs = (foldl' (+) 0.0 (map f xs)) / (fromIntegral (length xs))
+
+avg :: Fractional a => [a] -> a
+avg = avgBy id
 
 insideZeroOne :: Double -> Bool
 insideZeroOne v = 0 <= v && v <= 1
@@ -118,7 +124,7 @@ readDataset' input xs = do
     then return xs
     else do
         line <- hGetLine input
-        let entries = splitWith ',' line
+        let entries = splitWith (== ',') line
         if length entries == 5
         then do
             let toDouble = \n -> read n :: Double
@@ -126,25 +132,22 @@ readDataset' input xs = do
             let entryClass = head $ drop 4 entries
             let dataItem = (a, b, c, d, irisFromString entryClass)
             readDataset' input (dataItem : xs)
-        else do
-            readDataset' input xs
+        else readDataset' input xs
 
 preprocess :: DataSet -> [ProcessedDataItem]
-preprocess dataset = zip5 as' bs' cs' ds' irises'
-            where (as, bs, cs, ds, irises) = unzip5 dataset
+preprocess dataset = zip5 xs' zs' us' vs' irises'
+            where (xs, zs, us, vs, irises) = unzip5 dataset
                   irises' = map irisToDouble irises
-                  [as', bs', cs', ds'] = map normalize [as, bs, cs, ds]
-                  normalize xs = let min = minimum xs
-                                     max = maximum xs
+                  [xs', zs', us', vs'] = map normalize [xs, zs, us, vs]
+                  normalize ws = let min = minimum ws
+                                     max = maximum ws
                                      invSpan = 1.0 / (max - min)
-                                 in map (\x -> invSpan * (x - min)) xs 
+                                 in map (\x -> invSpan * (x - min)) ws 
 
 computeScore :: [Iris] -> [Iris] -> Double
 computeScore predictions answers | null predictions || null answers = 0.0
-computeScore predictions answers =
-    let denominator = length answers
-        numerator = length $ filter id $ zipWith (==) predictions answers
-    in fromIntegral numerator / fromIntegral denominator
+computeScore predictions answers = avgBy matchToInt $ zip predictions answers
+    where matchToInt (a, b) = if a == b then 1.0 else 0.0
 
 antecedent :: ([Double], [Double], [Double]) -> Double
 antecedent (xs, as, cs) = product $ map antecedentConjunct $ zip3 xs as cs
@@ -199,7 +202,7 @@ fromParamsVector (xs, clusterCount, featureCount) =
         (cs, bs) = extractACs clusterCount xs'
     in TSKZero clusterCount as cs bs
     where
-        extractACs clustersLeft xs | clustersLeft == 0 = ([], xs)
+        extractACs 0 xs = ([], xs)
         extractACs clustersLeft xs = (cluster : otherACs, otherVec)
             where (cluster, rest) = splitAt featureCount xs
                   (otherACs, otherVec) = extractACs (clustersLeft - 1) rest
@@ -209,35 +212,38 @@ euclidean [] [] = 0.0
 euclidean xs ys | length xs /= length ys = error "Euclidean: uneven lists"
 euclidean (x:xs) (y:ys) = (x - y) ** 2 + euclidean xs ys
 
+sqrtEuclidean :: [Double] -> [Double] -> Double
+sqrtEuclidean xs ys = sqrt $ euclidean xs ys
+
 d :: [Double] -> [Double] -> Int -> Int -> Double
 d x c n nSum = (fromIntegral n) * euclidean c x / (fromIntegral nSum)
 
-newCluster c x alpha = map updateClusterElems (zip c x)
+updateCluster :: [Double] -> [Double] -> Double -> [Double]
+updateCluster c x alpha = map updateClusterElems (zip c x)
     where updateClusterElems (ce, xe) = ce + alpha * (xe - ce)
 
 structIdEpoch :: Int -> Int -> Sqnc.Seq [Double] -> Sqnc.Seq Int ->
     Double -> Double -> [ProcessedDataItem] -> Double -> (Sqnc.Seq [Double], Int, Double)
-structIdEpoch epoch maxEpoch cs _ _ _ _ _| epoch > maxEpoch = (cs, epoch - 1, 0.0)
 structIdEpoch epoch maxEpoch cs ns alphaW alphaR ds eps =
-    let epochRatio = (fromIntegral epoch) / (fromIntegral maxEpoch)
-        iteration (cs, ns, alphaW, alphaR) (x, z, u, v, _) =
-            let ftrs = [x, z, u, v]
-                indices = Sqnc.fromFunction (length cs) id
-                nSum = sum ns
-                criterion = compare `on` \(_, cs, n) -> d ftrs cs n nSum
-                clusters = Sqnc.zip3 indices cs ns
-                [(wi, w, wn), (ri, r, rn)] = toList $ Sqnc.take 2
-                        (Sqnc.sortBy criterion clusters)
-                newNs = Sqnc.update wi (wn + 1) ns
-                newCs = Sqnc.update wi (newCluster w ftrs alphaW) $
-                        Sqnc.update ri (newCluster r ftrs (-alphaR)) cs
-                newAlphaW = alphaW * (1.0 - epochRatio)
-                newAlphaR = alphaR * (1.0 - epochRatio)
-            in (newCs, newNs, newAlphaW, newAlphaR)
-        (newCs, newNs, newAlphaW, newAlphaR) = foldl' iteration (cs, ns, alphaW, alphaR) ds
-        diff = avg (\(oldC, newC, newN) -> d oldC newC newN (sum newNs)) $
-                toList (Sqnc.zip3 cs newCs newNs)
-    in if diff < eps
+    let iteration (cs, ns) (x, z, u, v, _) = (newCs, newNs)
+            where ftrs = [x, z, u, v]
+                  indices = Sqnc.fromFunction (length cs) id
+                  nSum = sum ns
+                  criterion = compare `on` \(_, cs, n) -> d ftrs cs n nSum
+                  clusters = Sqnc.zip3 indices cs ns
+                  [(wi, w, wn), (ri, r, rn)] = toList $ Sqnc.take 2
+                            (Sqnc.sortBy criterion clusters)
+                  newNs = Sqnc.update wi (wn + 1) ns
+                  newCs = Sqnc.update wi (updateCluster w ftrs alphaW) $
+                          Sqnc.update ri (updateCluster r ftrs (-alphaR)) cs
+
+        (newCs, newNs) = foldl' iteration (cs, ns) ds
+        diff = avgBy (\(oldC, newC) -> sqrtEuclidean oldC newC) $
+                toList (Sqnc.zip cs newCs)
+        epochRatio = (fromIntegral epoch) / (fromIntegral maxEpoch)
+        newAlphaW = alphaW * (1.0 - epochRatio)
+        newAlphaR = alphaR * (1.0 - epochRatio)
+    in if diff <= eps || epoch == maxEpoch
        then (newCs, epoch, diff)
        else structIdEpoch (epoch + 1) maxEpoch newCs newNs newAlphaW newAlphaR ds eps
 
@@ -279,7 +285,7 @@ costFunction :: Int -> Int -> [ProcessedDataItem] -> [Double] -> Double
 costFunction clusterCount featureCount dataset xs =
     let model = fromParamsVector (xs, clusterCount, featureCount)
         localCost (x, z, u, v, y) = (predict model (x, z, u, v) - y) ** 2 
-    in avg id (map localCost dataset)
+    in avg (map localCost dataset)
 
 constraints :: Int -> Int -> [Double] -> [Bool]
 constraints clusterCount featureCount xs =
