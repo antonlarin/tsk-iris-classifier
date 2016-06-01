@@ -333,7 +333,7 @@ psoIteration iter maxIter costThreshold xs vs ps pg cost checkConstraints =
                 brokenConstraints = checkConstraints newX
             in if any id brokenConstraints
                then stepX (x, shrinkV v brokenConstraints)
-               else (x, v)
+               else (newX, v)
             where shrinkV v constraintsMask =
                     map (\(v, p) -> if p then 0.5 * v else v) $
                     zip v constraintsMask
