@@ -286,20 +286,22 @@ constraints clusterCount featureCount xs =
         checkA (clusterCount * featureCount) xs
     where
         checkA 0 ys = checkC (clusterCount * featureCount) ys
-        checkA elemsLeft (y:ys) = (y > 0) : checkA (elemsLeft - 1) ys
+        checkA count (y:ys) = (y <= 0) : checkA (count - 1) ys
 
         checkC 0 ys = checkB clusterCount ys
-        checkC elemsLeft (y:ys) = insideZeroOne y : checkC (elemsLeft - 1) ys
+        checkC count (y:ys) = outsideZeroOne y : checkC (count - 1) ys
 
         checkB 0 [] = []
-        checkB elemsLeft (y:ys) = someClass y : checkB (elemsLeft - 1) ys
-            where someClass y = 0.0 <= y && y <= 3.0
+        checkB count (y:ys) = notAClass y : checkB (count - 1) ys
+            where notAClass y = y < 0.0 || y > 3.0
+
+        outsideZeroOne = not . insideZeroOne
 
 
 psoIteration :: Int -> Int -> Double ->
     [[Double]] -> [[Double]] -> [[Double]] -> [Double] ->
-    ([Double] -> Double) -> ([Double] -> [Bool]) -> IO [[Double]]
-psoIteration iter maxIter _  xs _ _ _ _ _ | iter > maxIter = return xs
+    ([Double] -> Double) -> ([Double] -> [Bool]) -> IO [Double]
+psoIteration iter maxIter _ _ _ _ pg _ _ | iter > maxIter = return pg
 psoIteration iter maxIter costThreshold xs vs ps pg cost checkConstraints =
     let
     in do
@@ -311,7 +313,7 @@ psoIteration iter maxIter costThreshold xs vs ps pg cost checkConstraints =
         let newPs = map chooseLessCostly $ zip ps xs
         let newPg = head $ sortBy (compare `on` cost) (pg : xs)
         if cost newPg < costThreshold
-        then return newXs
+        then return newPg
         else psoIteration (iter + 1) maxIter costThreshold
                     newXs correctedVs newPs newPg cost checkConstraints
     where
@@ -351,8 +353,7 @@ optimizeModel model dataset = do
         let cost = costFunction clusterCount featureCount dataset
         let pg = head (sortBy (compare `on` cost) xs)
 
-        optimizedXs <- psoIteration 1 maxIterations costThreshold xs vs xs pg cost (constraints clusterCount featureCount)
-        let optimizedParams = head optimizedXs
+        optimizedParams <- psoIteration 1 maxIterations costThreshold xs vs xs pg cost (constraints clusterCount featureCount)
         return (fromParamsVector (optimizedParams, clusterCount, featureCount))
     where
         swarmSize = 50
