@@ -17,8 +17,9 @@ main = do
     let seed = 123
     setStdGen $ mkStdGen seed
     shuffledDataset <- shuffle dataset
+    let processedDataset = preprocess shuffledDataset
     let folds = 10
-    let trainTestPairs = crossValidationSplit folds shuffledDataset
+    let trainTestPairs = crossValidationSplit folds processedDataset
     scores <- mapM buildAndTestModel trainTestPairs
     let (preOptScores, postOptScores) = unzip scores
     let meanPreOptScore = avg preOptScores
@@ -103,11 +104,12 @@ irisFromDouble val | 0 <= val && val < 1 = Setosa
 
 
 type DataItem = (Double, Double, Double, Double, Iris)
-type DataSet = [DataItem]
+type Dataset = [DataItem]
 itemClass :: DataItem -> Iris
 itemClass (_, _, _, _, iris) = iris
 
 type ProcessedDataItem = (Double, Double, Double, Double, Double)
+type ProcessedDataset = [ProcessedDataItem]
 
 procItemResponse :: ProcessedDataItem -> Double
 procItemResponse (_, _, _, _, resp) = resp
@@ -116,10 +118,10 @@ procItemFeatures :: ProcessedDataItem -> (Double, Double, Double, Double)
 procItemFeatures (a, b, c, d, _) = (a, b, c, d)
 
 
-readDataset :: Handle -> IO DataSet
+readDataset :: Handle -> IO Dataset
 readDataset input = readDataset' input []
 
-readDataset' :: Handle -> DataSet -> IO DataSet
+readDataset' :: Handle -> Dataset -> IO Dataset
 readDataset' input xs = do
     endOfInput <- hIsEOF input
     if endOfInput
@@ -136,7 +138,7 @@ readDataset' input xs = do
             readDataset' input (dataItem : xs)
         else readDataset' input xs
 
-preprocess :: DataSet -> [ProcessedDataItem]
+preprocess :: Dataset -> ProcessedDataset
 preprocess dataset = zip5 xs' zs' us' vs' irises'
             where (xs, zs, us, vs, irises) = unzip5 dataset
                   irises' = map irisToDouble irises
@@ -164,23 +166,23 @@ predict (TSKZero rulesCount aSets cSets bs) (x, y, z, w) =
     in numerator / denominator
     where tupleProduct (p, b) = p * b
 
-buildAndTestModel :: (DataSet, DataSet) -> IO (Double, Double)
+buildAndTestModel :: (ProcessedDataset, ProcessedDataset) ->
+        IO (Double, Double)
 buildAndTestModel (train, test) = do
-        let procTrain = preprocess train
-        let procTest = preprocess test
         putStrLn $ "Train: " ++ (show $ length train) ++ ", test: " ++
             (show $ length test)
-        let testClasses = map itemClass test
-        model <- identifyModel procTrain
-        let preOptPredictions = map (predictClass model) procTest
+        let testClasses = map (irisFromDouble . procItemResponse) test
+        model <- identifyModel train
+        let preOptPredictions = map (predictClass model) test
         let preOptScore = computeScore preOptPredictions testClasses
-        model <- optimizeModel model procTrain
-        let postOptPredictions = map (predictClass model) procTest
+        model <- optimizeModel model train
+        let postOptPredictions = map (predictClass model) test
         let postOptScore = computeScore postOptPredictions testClasses
         return (preOptScore, postOptScore)
     where predictClass m = irisFromDouble . predict m . procItemFeatures
 
-crossValidationSplit :: Int -> DataSet -> [(DataSet, DataSet)]
+crossValidationSplit :: Int -> ProcessedDataset ->
+        [(ProcessedDataset, ProcessedDataset)]
 crossValidationSplit folds dataset =
         let size = length dataset
             smallerFoldSize = size `div` folds
