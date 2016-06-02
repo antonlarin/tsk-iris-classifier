@@ -3,17 +3,18 @@ import System.Random (randomRIO, mkStdGen, setStdGen)
 import Data.Array.IO (IOArray, newListArray, readArray, writeArray)
 import Control.Monad (forM)
 import Data.Char (toLower)
-import Data.List (unzip5, zip5, zip6, sortBy)
+import Data.List (unzip5, zip5, zip6, sortBy, sort)
 import qualified Data.Sequence as Sqnc
 import Data.Foldable (toList, foldl')
 import Data.Function (on)
+import Debug.Trace
 
 main :: IO ()
 main = do
     input <- openFile "iris.data" ReadMode
     dataset <- readDataset input
     hClose input
-    let seed = 154
+    let seed = 123
     setStdGen $ mkStdGen seed
     shuffledDataset <- shuffle dataset
     let folds = 10
@@ -58,7 +59,7 @@ extractFolds xs lens = extractFolds' xs [] lens
     where extractFolds' :: [a] -> [a] -> [Int] -> [([a], [a])]
           extractFolds' _ _ [] = []
           extractFolds' xs front (len:lens) =
-                        (newFold, front ++ rest) :
+                        (front ++ rest, newFold) :
                         extractFolds' rest (front ++ newFold) lens
                     where (newFold, rest) = splitAt len xs
 
@@ -98,6 +99,7 @@ irisFromDouble :: Double -> Iris
 irisFromDouble val | 0 <= val && val < 1 = Setosa
                    | 1 <= val && val < 2 = Versicolor
                    | 2 <= val && val <= 3 = Virginica
+                   | otherwise = error "Can't convert Double to Iris"
 
 
 type DataItem = (Double, Double, Double, Double, Iris)
@@ -146,17 +148,17 @@ preprocess dataset = zip5 xs' zs' us' vs' irises'
 
 computeScore :: [Iris] -> [Iris] -> Double
 computeScore predictions answers | null predictions || null answers = 0.0
-computeScore predictions answers = avgBy matchToInt $ zip predictions answers
-    where matchToInt (a, b) = if a == b then 1.0 else 0.0
+computeScore predictions answers = avgBy matchAsInt $ zip predictions answers
+    where matchAsInt (a, b) = if a == b then 1.0 else 0.0
 
 antecedent :: ([Double], [Double], [Double]) -> Double
 antecedent (xs, as, cs) = product $ map antecedentConjunct $ zip3 xs as cs
-    where antecedentConjunct (x, a, c) = exp ((x - c) ** 2 / ((-2) * a * a))
+    where antecedentConjunct (x, a, c) = exp ((x - c) ** 2 / (-2 * a * a))
 
 predict :: Model -> (Double, Double, Double, Double) -> Double
 predict (TSKZero rulesCount aSets cSets bs) (x, y, z, w) =
-    let inputSets = replicate rulesCount [x, y, z, w]
-        antecedents = map antecedent $ zip3 inputSets aSets cSets
+    let xSets = replicate rulesCount [x, y, z, w]
+        antecedents = map antecedent $ zip3 xSets aSets cSets
         numerator = sum $ map tupleProduct $ zip antecedents bs
         denominator = sum antecedents
     in numerator / denominator
@@ -166,6 +168,8 @@ buildAndTestModel :: (DataSet, DataSet) -> IO (Double, Double)
 buildAndTestModel (train, test) = do
         let procTrain = preprocess train
         let procTest = preprocess test
+        putStrLn $ "Train: " ++ (show $ length train) ++ ", test: " ++
+            (show $ length test)
         let testClasses = map itemClass test
         model <- identifyModel procTrain
         let preOptPredictions = map (predictClass model) procTest
@@ -182,8 +186,8 @@ crossValidationSplit folds dataset =
             smallerFoldSize = size `div` folds
             leftover = size `mod` folds
             biggerFoldSize = smallerFoldSize + 1
-            foldSizes = replicate leftover smallerFoldSize ++
-                        replicate (folds - leftover) biggerFoldSize
+            foldSizes = replicate leftover biggerFoldSize ++
+                        replicate (folds - leftover) smallerFoldSize
         in extractFolds dataset foldSizes
 
 
@@ -193,24 +197,24 @@ data Model = TSKZero Int [[Double]] [[Double]] [Double]
 paramsVector :: Model -> ([Double], Int, Int)
 paramsVector (TSKZero clusterCount as cs bs) =
         (flatten as ++ flatten cs ++ bs, clusterCount, length (head as))
-    where flatten xss = foldl' (++) [] xss
+    where flatten xss = foldr (++) [] xss
 
 fromParamsVector :: ([Double], Int, Int) -> Model
 fromParamsVector (xs, clusterCount, featureCount) =
     let
-        (as, xs') = extractACs clusterCount xs
-        (cs, bs) = extractACs clusterCount xs'
+        (as, xs') = unflatten clusterCount xs
+        (cs, bs) = unflatten clusterCount xs'
     in TSKZero clusterCount as cs bs
     where
-        extractACs 0 xs = ([], xs)
-        extractACs clustersLeft xs = (cluster : otherACs, otherVec)
+        unflatten 0 xs = ([], xs)
+        unflatten clustersLeft xs = (cluster : otherACs, otherVec)
             where (cluster, rest) = splitAt featureCount xs
-                  (otherACs, otherVec) = extractACs (clustersLeft - 1) rest
+                  (otherACs, otherVec) = unflatten (clustersLeft - 1) rest
 
 euclidean :: [Double] -> [Double] -> Double
-euclidean [] [] = 0.0
 euclidean xs ys | length xs /= length ys = error "Euclidean: uneven lists"
-euclidean (x:xs) (y:ys) = (x - y) ** 2 + euclidean xs ys
+                | otherwise = foldl' step 0.0 $ zip xs ys
+    where step acc (x, y) = acc + (x - y) ** 2
 
 sqrtEuclidean :: [Double] -> [Double] -> Double
 sqrtEuclidean xs ys = sqrt $ euclidean xs ys
@@ -225,27 +229,27 @@ updateCluster c x alpha = map updateClusterElems (zip c x)
 structIdEpoch :: Int -> Int -> Sqnc.Seq [Double] -> Sqnc.Seq Int ->
     Double -> Double -> [ProcessedDataItem] -> Double -> (Sqnc.Seq [Double], Int, Double)
 structIdEpoch epoch maxEpoch cs ns alphaW alphaR ds eps =
-    let iteration (cs, ns) (x, z, u, v, _) = (newCs, newNs)
+    let iteration (cs, ns) (x, z, u, v, _) = (cs', ns')
             where ftrs = [x, z, u, v]
-                  indices = Sqnc.fromFunction (length cs) id
+                  indices = Sqnc.fromList [0..(length cs - 1)]
                   nSum = sum ns
-                  criterion = compare `on` \(_, cs, n) -> d ftrs cs n nSum
+                  criterion = compare `on` \(_, c, n) -> d ftrs c n nSum
                   clusters = Sqnc.zip3 indices cs ns
-                  [(wi, w, wn), (ri, r, rn)] = toList $ Sqnc.take 2
-                            (Sqnc.sortBy criterion clusters)
-                  newNs = Sqnc.update wi (wn + 1) ns
-                  newCs = Sqnc.update wi (updateCluster w ftrs alphaW) $
-                          Sqnc.update ri (updateCluster r ftrs (-alphaR)) cs
+                  ((wi, w, wn):(ri, r, _):_) = toList $
+                        Sqnc.unstableSortBy criterion clusters
+                  ns' = Sqnc.update wi (wn + 1) ns
+                  cs' = Sqnc.update wi (updateCluster w ftrs alphaW) $
+                        Sqnc.update ri (updateCluster r ftrs (-alphaR)) cs
 
-        (newCs, newNs) = foldl' iteration (cs, ns) ds
+        (cs', ns') = foldl' iteration (cs, ns) ds
         diff = avgBy (\(oldC, newC) -> sqrtEuclidean oldC newC) $
-                toList (Sqnc.zip cs newCs)
+                toList (Sqnc.zip cs cs')
         epochRatio = (fromIntegral epoch) / (fromIntegral maxEpoch)
-        newAlphaW = alphaW * (1.0 - epochRatio)
-        newAlphaR = alphaR * (1.0 - epochRatio)
+        alphaW' = alphaW * (1.0 - epochRatio)
+        alphaR' = alphaR * (1.0 - epochRatio)
     in if diff <= eps || epoch == maxEpoch
-       then (newCs, epoch, diff)
-       else structIdEpoch (epoch + 1) maxEpoch newCs newNs newAlphaW newAlphaR ds eps
+       then (cs', epoch, diff)
+       else structIdEpoch (epoch + 1) maxEpoch cs' ns' alphaW' alphaR' ds eps
 
 identifyModel :: [ProcessedDataItem] -> IO Model
 identifyModel dataset = do
@@ -257,6 +261,8 @@ identifyModel dataset = do
         putStrLn $ "Epochs required: " ++ show epochs
         putStrLn $ "Diff achieved: " ++ show diff
         let filteredCs = toList (Sqnc.filter (all insideZeroOne) cs)
+        putStrLn $ "Clusters before: " ++ (show $ length cs) ++ " after: " ++
+                (show $ length filteredCs)
         let as = toList (map (findAs filteredCs) filteredCs)
         let features = map procItemFeatures dataset
         let responses = map procItemResponse dataset
@@ -269,14 +275,13 @@ identifyModel dataset = do
         alphaW = 0.06
         alphaR = 0.02
         r = 1.5
-        findAs cs c = let (ck:ch:_) = sortBy (closestToC) cs
-                      in replicate 4 (euclidean ck ch / r)
-            where closestToC = compare `on` (\c' -> euclidean c c')
-        findB ftrs rspns (as, cs) = if denom == 0
+        findAs cs c = let (_:sqrDist:_) = sort $ map (euclidean c) cs
+                      in replicate 4 (sqrDist / r)
+        findB ftrs rspns (a, c) = if denom == 0
                                     then 0.0
                                     else numer / denom
             where step (numer', denom') ((x, z, u, v), y) =
-                        let alpha = antecedent ([x, z, u, v], as, cs)
+                        let alpha = antecedent ([x, z, u, v], a, c)
                         in (numer' + alpha * y, denom' + alpha)
                   (numer, denom) = foldl' step (0.0, 0.0) $ zip ftrs rspns
 
@@ -285,7 +290,7 @@ costFunction :: Int -> Int -> [ProcessedDataItem] -> [Double] -> Double
 costFunction clusterCount featureCount dataset xs =
     let model = fromParamsVector (xs, clusterCount, featureCount)
         localCost (x, z, u, v, y) = (predict model (x, z, u, v) - y) ** 2 
-    in avg (map localCost dataset)
+    in avgBy localCost dataset
 
 constraints :: Int -> Int -> [Double] -> [Bool]
 constraints clusterCount featureCount xs =
@@ -308,9 +313,7 @@ psoIteration :: Int -> Int -> Double ->
     [[Double]] -> [[Double]] -> [[Double]] -> [Double] ->
     ([Double] -> Double) -> ([Double] -> [Bool]) -> IO [Double]
 psoIteration iter maxIter _ _ _ _ pg _ _ | iter > maxIter = return pg
-psoIteration iter maxIter costThreshold xs vs ps pg cost checkConstraints =
-    let
-    in do
+psoIteration iter maxIter costThreshold xs vs ps pg cost checkConstr = do
         let components = length xs
         rands1 <- forM [1..components] $ \_ -> randomRIO (0.0, 1.0)
         rands2 <- forM [1..components] $ \_ -> randomRIO (0.0, 1.0)
@@ -321,7 +324,7 @@ psoIteration iter maxIter costThreshold xs vs ps pg cost checkConstraints =
         if cost newPg < costThreshold
         then return newPg
         else psoIteration (iter + 1) maxIter costThreshold
-                    newXs correctedVs newPs newPg cost checkConstraints
+                    newXs correctedVs newPs newPg cost checkConstr
     where
         w = 0.5
         c1 = 0.3
@@ -335,8 +338,8 @@ psoIteration iter maxIter costThreshold xs vs ps pg cost checkConstraints =
                   replicatedRand2 = replicate (length x) rand2
 
         stepX (x, v) =
-            let newX = map (\(xe, ve) -> xe + ve) $ zip x v -- no constraints
-                brokenConstraints = checkConstraints newX
+            let newX = map (\(xe, ve) -> xe + ve) $ zip x v
+                brokenConstraints = checkConstr newX
             in if any id brokenConstraints
                then stepX (x, shrinkV v brokenConstraints)
                else (newX, v)
@@ -359,7 +362,8 @@ optimizeModel model dataset = do
         let cost = costFunction clusterCount featureCount dataset
         let pg = head (sortBy (compare `on` cost) xs)
 
-        optimizedParams <- psoIteration 1 maxIterations costThreshold xs vs xs pg cost (constraints clusterCount featureCount)
+        optimizedParams <- psoIteration 1 maxIterations costThreshold xs vs
+            xs pg cost (constraints clusterCount featureCount)
         return (fromParamsVector (optimizedParams, clusterCount, featureCount))
     where
         swarmSize = 50
