@@ -8,19 +8,22 @@ import qualified Data.Sequence as Sqnc
 import Data.Foldable (toList, foldl', minimumBy)
 import Data.Function (on)
 import Debug.Trace
+import System.Environment (getArgs)
 
 main :: IO ()
 main = do
     input <- openFile "iris.data" ReadMode
     dataset <- readDataset input
     hClose input
+    stringParams <- getArgs
+    let params = parseParams stringParams
     let seed = 123
     setStdGen $ mkStdGen seed
     shuffledDataset <- shuffle dataset
     let processedDataset = preprocess shuffledDataset
     let folds = 10
     let trainTestPairs = crossValidationSplit folds processedDataset
-    scores <- mapM buildAndTestModel trainTestPairs
+    scores <- mapM (buildAndTestModel params) trainTestPairs
     let (preOptScores, postOptScores) = unzip scores
     let meanPreOptScore = avg preOptScores
     let meanPostOptScore = avg postOptScores
@@ -98,7 +101,7 @@ irisFromDouble :: Double -> Iris
 irisFromDouble val | 0 <= val && val < 1 = Setosa
                    | 1 <= val && val < 2 = Versicolor
                    | 2 <= val && val <= 3 = Virginica
-                   | otherwise = error "Can't convert Double to Iris"
+                   | otherwise = error "Can't convert Double to Iris "
 
 
 type DataItem = (Double, Double, Double, Double, Iris)
@@ -136,6 +139,38 @@ readDataset' input xs = do
             readDataset' input (dataItem : xs)
         else readDataset' input xs
 
+data Parameters = Parameters {
+    clusterCountLimit :: Int,
+    alphaW :: Double,
+    alphaR :: Double,
+    maxEpochSID :: Int,
+    epsSID :: Double,
+    swarmSize :: Int,
+    omega :: Double,
+    c1 :: Double,
+    c2 :: Double,
+    maxIterationPSO :: Int,
+    epsPSO :: Double
+}
+
+parseParams :: [String] -> Parameters
+parseParams strParams | length strParams /= 11 = error "11 args required"
+                      | otherwise =
+    let clusterCountLimit = read (strParams !! 0) :: Int
+        alphaW = read (strParams !! 1) :: Double
+        alphaR = read (strParams !! 2) :: Double
+        maxEpochSID = read (strParams !! 3) :: Int
+        epsSID = read (strParams !! 4) :: Double
+        swarmSize = read (strParams !! 5) :: Int
+        omega = read (strParams !! 6) :: Double
+        c1 = read (strParams !! 7) :: Double
+        c2 = read (strParams !! 8) :: Double
+        maxIterationPSO = read (strParams !! 9) :: Int
+        epsPSO = read (strParams !! 10) :: Double
+    in Parameters clusterCountLimit alphaW alphaR maxEpochSID epsSID
+            swarmSize omega c1 c2 maxIterationPSO epsPSO
+
+
 preprocess :: Dataset -> ProcessedDataset
 preprocess dataset = zip5 xs' zs' us' vs' irises'
             where (xs, zs, us, vs, irises) = unzip5 dataset
@@ -160,16 +195,18 @@ predict (TSKZero rulesCount aSets cSets bs) (x, y, z, w) =
         antecedents = map antecedent $ zip3 xSets aSets cSets
         numerator = sum $ map tupleProduct $ zip antecedents bs
         denominator = sum antecedents
-    in numerator / denominator
+    in if denominator == 0
+       then 0.0
+       else numerator / denominator
     where tupleProduct (p, b) = p * b
 
-buildAndTestModel :: (ProcessedDataset, ProcessedDataset) ->
+buildAndTestModel :: Parameters -> (ProcessedDataset, ProcessedDataset) ->
         IO (Double, Double)
-buildAndTestModel (train, test) =
+buildAndTestModel params (train, test) =
     putStrLn ("Train: " ++ (show $ length train) ++ ", test: " ++
         (show $ length test)) >>
-    identifyModel train >>= \model ->
-    optimizeModel model train >>= \model' ->
+    identifyModel params train >>= \model ->
+    optimizeModel params model train >>= \model' ->
     let testClasses = map (irisFromDouble . procItemResponse) test
         predictClass m = irisFromDouble . predict m . procItemFeatures
         preOptPredictions = map (predictClass model) test
@@ -255,14 +292,16 @@ structIdEpoch epoch maxEpoch cs ns alphaW alphaR ds eps =
        then (cs', epoch, diff)
        else structIdEpoch (epoch + 1) maxEpoch cs' ns' alphaW' alphaR' ds eps
 
-identifyModel :: [ProcessedDataItem] -> IO Model
-identifyModel dataset = do
-        let startNs = Sqnc.replicate clusterCountLimit 1
+identifyModel :: Parameters -> [ProcessedDataItem] -> IO Model
+identifyModel params dataset = do
+        let startNs = Sqnc.replicate (clusterCountLimit params) 1
         let rand = \_ -> randomRIO (0.0, 1.0)
-        startCs <- forM (Sqnc.fromList [1..clusterCountLimit]) $
+        startCs <- forM (Sqnc.fromList [1..clusterCountLimit params]) $
                    \_ -> forM [1..4] rand
         putStrLn $ show startCs
-        let (cs, epochs, diff) = structIdEpoch 1 maxEpoch startCs startNs alphaW alphaR dataset epsilon
+        let (cs, epochs, diff) = (structIdEpoch 1 (maxEpochSID params)
+                startCs startNs (alphaW params) (alphaR params)
+                dataset (epsSID params))
         putStrLn $ "Epochs required: " ++ show epochs
         putStrLn $ "Diff achieved: " ++ show diff
         putStrLn $ show cs
@@ -278,11 +317,6 @@ identifyModel dataset = do
             let bs = map (findB features responses) (zip as filteredCs)
             return (TSKZero (length as) as filteredCs bs)
     where
-        clusterCountLimit = 30
-        maxEpoch = 10
-        epsilon = 0.0001
-        alphaW = 0.06
-        alphaR = 0.02
         r = 1.5
         findAs cs c = let neighborDists = sort $ map (euclidean c) cs
                           sqrDist = if length neighborDists >= 2
@@ -348,31 +382,30 @@ psoIteration iter maxIter costThreshold xs vs ps pg cost checkConstr = do
 
         stepX (x, v) = let newX = map (\(xe, ve) -> xe + ve) $ zip x v
                            brokenConstraints = checkConstr newX
-                       in (newX, v) if any id brokenConstraints
+                       in if any id brokenConstraints
                           then stepX (x, map (* 0.5) v)
                           else (newX, v)
 
         chooseLessCostly (a, b) | cost a < cost b = a
                                 | otherwise = b
 
-optimizeModel :: Model -> ProcessedDataset -> IO Model
-optimizeModel model dataset = do
+optimizeModel :: Parameters -> Model -> ProcessedDataset -> IO Model
+optimizeModel params model dataset = do
         let (x0, clusterCount, featureCount) = paramsVector model
         let n = length x0
         let rand = \_ -> randomRIO (0.0, 1.0)
-        otherXs <- forM [1..(swarmSize - 1)] $
+        otherXs <- forM [1..swarmSize params - 1] $
                    \_ -> forM [1..n] rand
         let xs = x0 : otherXs
-        let vs = replicate swarmSize (replicate n 0.0)
+        let vs = replicate (swarmSize params) (replicate n 0.0)
         let cost = costFunction clusterCount featureCount dataset
         let pg = minimumBy (compare `on` cost) xs
 
-        (optimizedParams, iters, diff) <- psoIteration 1 maxIterations costThreshold xs vs
+        (optimizedParams, iters, diff) <-
+                psoIteration 1 (maxIterationPSO params) (epsPSO params) xs vs
             xs pg cost (constraints clusterCount featureCount)
         putStrLn $ "Optimization steps: " ++ (show iters) ++ ", eps: " ++ (show diff)
-        return (fromParamsVector (optimizedParams, clusterCount, featureCount))
-    where
-        swarmSize = 20
-        maxIterations = 20
-        costThreshold = 0.05
+        let model@(TSKZero _ _ cs _) = fromParamsVector (optimizedParams, clusterCount, featureCount)
+        putStrLn (show model)
+        return model
 
